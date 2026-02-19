@@ -38,6 +38,15 @@ const ACCEL_UPSWING_THRESHOLD = 0.5;    // m/s² min accel to count as "was acce
 // Flat plane constraint
 let flatPlaneEnabled = true;
 
+// Smoke trail settings
+let trailEnabled = true;
+const TRAIL_LENGTH = 400;               // number of points in trail buffer
+const TRAIL_SCROLL_SPEED = 0.5;         // m/s backward scroll
+const TRAIL_COLORS = [
+  new THREE.Color(0.2, 0.8, 1.0),       // left hand: cyan
+  new THREE.Color(1.0, 0.5, 0.2),       // right hand: orange
+];
+
 const BALL_COLORS = [
   0xff4466,  // warm red-pink
   0x44bbff,  // sky blue
@@ -214,6 +223,25 @@ class ControllerState {
     this.laser.visible = false;
     this.controller.add(this.laser);
 
+    // ─── Smoke Trail ───
+    this.trailBuffer = [];  // ring buffer of { pos: Vector3, time: number }
+    const trailPositions = new Float32Array(TRAIL_LENGTH * 3);
+    const trailColorsArr = new Float32Array(TRAIL_LENGTH * 3); // RGB
+    this.trailGeo = new THREE.BufferGeometry();
+    this.trailGeo.setAttribute('position', new THREE.BufferAttribute(trailPositions, 3));
+    this.trailGeo.setAttribute('color', new THREE.BufferAttribute(trailColorsArr, 3));
+    this.trailGeo.setDrawRange(0, 0);
+    const trailMat = new THREE.LineBasicMaterial({
+      vertexColors: true,
+      transparent: true,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+    });
+    this.trailLine = new THREE.Line(this.trailGeo, trailMat);
+    this.trailLine.frustumCulled = false;
+    this.trailLine.visible = false;
+    scene.add(this.trailLine);
+
     // Velocity tracking
     this.positionHistory = [];
     this.previousPos = new THREE.Vector3();
@@ -231,9 +259,10 @@ class ControllerState {
     this.wasAcceleratingUp = false;
     this.autoThrowCooldownUntil = 0;
 
-    // A/B-button state tracking
+    // A/B-button state tracking (right), X-button (left)
     this.aButtonDown = false;
     this.bButtonDown = false;
+    this.xButtonDown = false;
 
     // Events
     this.controller.addEventListener('connected', (event) => {
@@ -269,6 +298,48 @@ class ControllerState {
       const rawAccelY = (this.velocity.y - prevVelY) / dt;
       this.smoothedAccelY += ACCEL_SMOOTHING * (rawAccelY - this.smoothedAccelY);
     }
+
+    // Record trail position
+    if (trailEnabled) {
+      this.trailBuffer.push({ pos: currentPos.clone(), time: performance.now() });
+      if (this.trailBuffer.length > TRAIL_LENGTH) {
+        this.trailBuffer.shift();
+      }
+    }
+  }
+
+  updateTrail(now) {
+    if (!trailEnabled || this.trailBuffer.length < 2) {
+      this.trailLine.visible = false;
+      return;
+    }
+
+    this.trailLine.visible = true;
+    const positions = this.trailGeo.attributes.position.array;
+    const colors = this.trailGeo.attributes.color.array;
+    const trailColor = TRAIL_COLORS[this.index];
+    const count = this.trailBuffer.length;
+    const maxAge = TRAIL_LENGTH / 72; // approx seconds of trail
+
+    for (let i = 0; i < count; i++) {
+      const entry = this.trailBuffer[i];
+      const age = (now - entry.time) / 1000;
+      const fade = Math.max(0, 1.0 - (age / maxAge)); // 1.0 = newest, 0 = oldest
+
+      // Position: original X/Y, Z scrolled backward
+      positions[i * 3 + 0] = entry.pos.x;
+      positions[i * 3 + 1] = entry.pos.y;
+      positions[i * 3 + 2] = entry.pos.z - age * TRAIL_SCROLL_SPEED;
+
+      // Color: dim toward black for fade (additive blending: black = invisible)
+      colors[i * 3 + 0] = trailColor.r * fade * 0.7;
+      colors[i * 3 + 1] = trailColor.g * fade * 0.7;
+      colors[i * 3 + 2] = trailColor.b * fade * 0.7;
+    }
+
+    this.trailGeo.setDrawRange(0, count);
+    this.trailGeo.attributes.position.needsUpdate = true;
+    this.trailGeo.attributes.color.needsUpdate = true;
   }
 
   triggerHaptic(intensity = HAPTIC_INTENSITY, duration = HAPTIC_DURATION) {
@@ -330,6 +401,13 @@ class ControllerState {
     const gp = this.inputSource.gamepad;
     return gp.buttons.length > 5 && gp.buttons[5].pressed;
   }
+
+  // X button (buttons[4] on Quest left controller)
+  isXButtonPressed() {
+    if (!this.inputSource || !this.inputSource.gamepad) return false;
+    const gp = this.inputSource.gamepad;
+    return gp.buttons.length > 4 && gp.buttons[4].pressed;
+  }
 }
 
 const controllers = [
@@ -369,6 +447,26 @@ class Ball {
     this.throwImmunityUntil = 0; // timestamp: immune from auto-catch until this time
     this.holdStartTime = 0;      // when ball was last caught/held
     this.releaseZ = -0.4;        // Z coordinate to lock to when flat plane is on
+
+    // Smoke trail for ball
+    this.trailBuffer = [];
+    const trailPositions = new Float32Array(TRAIL_LENGTH * 3);
+    const trailColorsArr = new Float32Array(TRAIL_LENGTH * 3);
+    this.trailGeo = new THREE.BufferGeometry();
+    this.trailGeo.setAttribute('position', new THREE.BufferAttribute(trailPositions, 3));
+    this.trailGeo.setAttribute('color', new THREE.BufferAttribute(trailColorsArr, 3));
+    this.trailGeo.setDrawRange(0, 0);
+    const trailMat = new THREE.LineBasicMaterial({
+      vertexColors: true,
+      transparent: true,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+    });
+    this.trailLine = new THREE.Line(this.trailGeo, trailMat);
+    this.trailLine.frustumCulled = false;
+    this.trailLine.visible = false;
+    this.trailColor = new THREE.Color(color);
+    scene.add(this.trailLine);
 
     // Sliding state
     this.slideStartPos = new THREE.Vector3();
@@ -520,6 +618,46 @@ class Ball {
     // Glow pulse
     const t = performance.now() * 0.003 + this.index * 2;
     this.glow.material.opacity = 0.08 + Math.sin(t) * 0.04;
+
+    // Record trail position (only in flight, not resting on ground)
+    const isMoving = this.velocity.lengthSq() > 0.1;
+    if (trailEnabled && isMoving) {
+      this.trailBuffer.push({ pos: this.mesh.position.clone(), time: performance.now() });
+      if (this.trailBuffer.length > TRAIL_LENGTH) {
+        this.trailBuffer.shift();
+      }
+    }
+  }
+
+  updateTrail(now) {
+    if (!trailEnabled || this.trailBuffer.length < 2) {
+      this.trailLine.visible = false;
+      return;
+    }
+
+    this.trailLine.visible = true;
+    const positions = this.trailGeo.attributes.position.array;
+    const colors = this.trailGeo.attributes.color.array;
+    const count = this.trailBuffer.length;
+    const maxAge = TRAIL_LENGTH / 72;
+
+    for (let i = 0; i < count; i++) {
+      const entry = this.trailBuffer[i];
+      const age = (now - entry.time) / 1000;
+      const fade = Math.max(0, 1.0 - (age / maxAge));
+
+      positions[i * 3 + 0] = entry.pos.x;
+      positions[i * 3 + 1] = entry.pos.y;
+      positions[i * 3 + 2] = entry.pos.z - age * TRAIL_SCROLL_SPEED;
+
+      colors[i * 3 + 0] = this.trailColor.r * fade * 0.7;
+      colors[i * 3 + 1] = this.trailColor.g * fade * 0.7;
+      colors[i * 3 + 2] = this.trailColor.b * fade * 0.7;
+    }
+
+    this.trailGeo.setDrawRange(0, count);
+    this.trailGeo.attributes.position.needsUpdate = true;
+    this.trailGeo.attributes.color.needsUpdate = true;
   }
 
   resetToSpawn() {
@@ -550,6 +688,7 @@ function removeBall() {
     if (idx !== -1) ball.holder.heldBalls.splice(idx, 1);
   }
   scene.remove(ball.mesh);
+  scene.remove(ball.trailLine);
 }
 
 // ─── Game Logic ──────────────────────────────────────────────────────
@@ -589,7 +728,8 @@ function updateHUD() {
   const pct = Math.round(gravityMultiplier * 100);
   const autoLabel = autoThrowEnabled ? 'ON' : 'OFF';
   const planeLabel = flatPlaneEnabled ? 'ON' : 'OFF';
-  hudCtx.fillText(`G:${pct}% B:${balls.length} Auto:${autoLabel} Plane:${planeLabel}`, 256, 64);
+  const trailLabel = trailEnabled ? 'ON' : 'OFF';
+  hudCtx.fillText(`G:${pct}% B:${balls.length} A:${autoLabel} P:${planeLabel} T:${trailLabel}`, 256, 64);
   hudTexture.needsUpdate = true;
 }
 updateHUD();
@@ -847,6 +987,30 @@ function checkAutoThrowToggle() {
   if (!bPressed && rightCtrl.bButtonDown) {
     rightCtrl.bButtonDown = false;
   }
+
+  // X button on left controller: toggle trails
+  const leftCtrl = controllers[0];
+  const xPressed = leftCtrl.isXButtonPressed();
+  if (xPressed && !leftCtrl.xButtonDown) {
+    leftCtrl.xButtonDown = true;
+    trailEnabled = !trailEnabled;
+    // Clear trail buffers when disabling
+    if (!trailEnabled) {
+      for (const ctrl of controllers) {
+        ctrl.trailBuffer.length = 0;
+        ctrl.trailLine.visible = false;
+      }
+      for (const ball of balls) {
+        ball.trailBuffer.length = 0;
+        ball.trailLine.visible = false;
+      }
+    }
+    updateHUD();
+    leftCtrl.triggerHaptic(0.2, 50);
+  }
+  if (!xPressed && leftCtrl.xButtonDown) {
+    leftCtrl.xButtonDown = false;
+  }
 }
 
 // ─── Animation Loop ──────────────────────────────────────────────────
@@ -884,11 +1048,22 @@ function animate() {
 
     // A-button toggle for auto-throw (right controller)
     checkAutoThrowToggle();
+
+    // Update smoke trails
+    for (const ctrl of controllers) {
+      ctrl.updateTrail(now);
+    }
   }
 
   // Update ball physics
   for (const ball of balls) {
     ball.update(dt);
+  }
+
+  // Update ball trails (outside VR check so they render in desktop too)
+  const trailNow = performance.now();
+  for (const ball of balls) {
+    ball.updateTrail(trailNow);
   }
 
   renderer.render(scene, camera);
