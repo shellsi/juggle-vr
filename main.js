@@ -1,7 +1,6 @@
 import * as THREE from 'three';
 import { VRButton } from 'three/addons/webxr/VRButton.js';
 import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
-
 // ─── Constants ───────────────────────────────────────────────────────
 const EARTH_GRAVITY = 9.81;
 const CATCH_RADIUS = 0.09;          // 9cm catch zone around each grip
@@ -46,6 +45,15 @@ const TRAIL_COLORS = [
   new THREE.Color(0.2, 0.8, 1.0),       // left hand: cyan
   new THREE.Color(1.0, 0.5, 0.2),       // right hand: orange
 ];
+const RIBBON_BASE_WIDTH = 0.002;        // base half-width of ribbon (5mm)
+const RIBBON_PITCH_SCALE = 0.03;        // extra half-width per radian of pitch
+// Ribbon width scales inversely with controller speed (m/s)
+const RIBBON_SPEED_REF = 1.2;           // speed where width ~= base+pitch
+const RIBBON_SPEED_EPS = 0.08;          // avoid division blow-up near 0
+const RIBBON_HALF_WIDTH_MIN = 0.0006;   // clamp for stability (half-width)
+const RIBBON_HALF_WIDTH_MAX = 0.01;     // clamp for stability (half-width)
+const TRAIL_FREEZE_VELOCITY_THRESHOLD = 0.15;  // m/s — freeze trails when total controller velocity below this
+const TRAIL_VELOCITY_REF = 1.0;  // m/s — scroll speed = TRAIL_SCROLL_SPEED when total velocity equals this
 
 const BALL_COLORS = [
   0xff4466,  // warm red-pink
@@ -223,24 +231,35 @@ class ControllerState {
     this.laser.visible = false;
     this.controller.add(this.laser);
 
-    // ─── Smoke Trail ───
-    this.trailBuffer = [];  // ring buffer of { pos: Vector3, time: number }
-    const trailPositions = new Float32Array(TRAIL_LENGTH * 3);
-    const trailColorsArr = new Float32Array(TRAIL_LENGTH * 3); // RGB
+    // ─── Smoke Trail Ribbon ───
+    this.trailBuffer = [];  // ring buffer of { pos: Vector3, time: number, quat: Quaternion }
+    const ribbonVertCount = TRAIL_LENGTH * 2; // 2 vertices per trail point (left/right)
+    const ribbonPositions = new Float32Array(ribbonVertCount * 3);
+    const ribbonColors = new Float32Array(ribbonVertCount * 3);
     this.trailGeo = new THREE.BufferGeometry();
-    this.trailGeo.setAttribute('position', new THREE.BufferAttribute(trailPositions, 3));
-    this.trailGeo.setAttribute('color', new THREE.BufferAttribute(trailColorsArr, 3));
+    this.trailGeo.setAttribute('position', new THREE.BufferAttribute(ribbonPositions, 3));
+    this.trailGeo.setAttribute('color', new THREE.BufferAttribute(ribbonColors, 3));
+
+    // Pre-compute triangle indices for the ribbon quads
+    const ribbonIndices = [];
+    for (let i = 0; i < TRAIL_LENGTH - 1; i++) {
+      const a = i * 2, b = i * 2 + 1, c = (i + 1) * 2, d = (i + 1) * 2 + 1;
+      ribbonIndices.push(a, b, c, b, d, c);
+    }
+    this.trailGeo.setIndex(ribbonIndices);
     this.trailGeo.setDrawRange(0, 0);
-    const trailMat = new THREE.LineBasicMaterial({
+
+    const ribbonMat = new THREE.MeshBasicMaterial({
       vertexColors: true,
       transparent: true,
+      side: THREE.DoubleSide,
       blending: THREE.AdditiveBlending,
       depthWrite: false,
     });
-    this.trailLine = new THREE.Line(this.trailGeo, trailMat);
-    this.trailLine.frustumCulled = false;
-    this.trailLine.visible = false;
-    scene.add(this.trailLine);
+    this.trailMesh = new THREE.Mesh(this.trailGeo, ribbonMat);
+    this.trailMesh.frustumCulled = false;
+    this.trailMesh.visible = false;
+    scene.add(this.trailMesh);
 
     // Velocity tracking
     this.positionHistory = [];
@@ -263,6 +282,7 @@ class ControllerState {
     this.aButtonDown = false;
     this.bButtonDown = false;
     this.xButtonDown = false;
+    this.trailsFrozen = false;
 
     // Events
     this.controller.addEventListener('connected', (event) => {
@@ -299,9 +319,11 @@ class ControllerState {
       this.smoothedAccelY += ACCEL_SMOOTHING * (rawAccelY - this.smoothedAccelY);
     }
 
-    // Record trail position
-    if (trailEnabled) {
-      this.trailBuffer.push({ pos: currentPos.clone(), time: performance.now() });
+    // Record trail position + orientation (skipped when total controller velocity below threshold)
+    if (trailEnabled && !this.trailsFrozen) {
+      const quat = new THREE.Quaternion();
+      this.grip.getWorldQuaternion(quat);
+      this.trailBuffer.push({ pos: currentPos.clone(), time: performance.now(), quat: quat });
       if (this.trailBuffer.length > TRAIL_LENGTH) {
         this.trailBuffer.shift();
       }
@@ -310,34 +332,80 @@ class ControllerState {
 
   updateTrail(now) {
     if (!trailEnabled || this.trailBuffer.length < 2) {
-      this.trailLine.visible = false;
+      this.trailMesh.visible = false;
       return;
     }
 
-    this.trailLine.visible = true;
+    this.trailMesh.visible = true;
     const positions = this.trailGeo.attributes.position.array;
     const colors = this.trailGeo.attributes.color.array;
     const trailColor = TRAIL_COLORS[this.index];
     const count = this.trailBuffer.length;
-    const maxAge = TRAIL_LENGTH / 72; // approx seconds of trail
+    const maxAge = TRAIL_LENGTH / 72;
+
+    const localRight = new THREE.Vector3();
+    const forward = new THREE.Vector3();
+    const delta = new THREE.Vector3();
+    let prevEntry = this.trailBuffer[0];
 
     for (let i = 0; i < count; i++) {
       const entry = this.trailBuffer[i];
       const age = (now - entry.time) / 1000;
-      const fade = Math.max(0, 1.0 - (age / maxAge)); // 1.0 = newest, 0 = oldest
+      const fade = Math.max(0, 1.0 - (age / maxAge));
 
-      // Position: original X/Y, Z scrolled backward
-      positions[i * 3 + 0] = entry.pos.x;
-      positions[i * 3 + 1] = entry.pos.y;
-      positions[i * 3 + 2] = entry.pos.z - age * TRAIL_SCROLL_SPEED;
+      // Center position with Z scroll
+      const cx = entry.pos.x;
+      const cy = entry.pos.y;
+      const cz = entry.pos.z - age * trailScrollSpeed;
 
-      // Color: dim toward black for fade (additive blending: black = invisible)
-      colors[i * 3 + 0] = trailColor.r * fade * 0.7;
-      colors[i * 3 + 1] = trailColor.g * fade * 0.7;
-      colors[i * 3 + 2] = trailColor.b * fade * 0.7;
+      // Extract pitch from quaternion: forward vector's Y component = sin(pitch)
+      forward.set(0, 0, -1).applyQuaternion(entry.quat);
+      const pitch = Math.asin(Math.max(-1, Math.min(1, forward.y)));
+
+      // Approx per-sample speed (m/s) from neighbor points
+      let speed = 0;
+      if (i === 0 && count > 1) {
+        const nextEntry = this.trailBuffer[1];
+        const dtSeg = (nextEntry.time - entry.time) / 1000;
+        if (dtSeg > 0) {
+          speed = delta.subVectors(nextEntry.pos, entry.pos).length() / dtSeg;
+        }
+      } else if (i > 0) {
+        const dtSeg = (entry.time - prevEntry.time) / 1000;
+        if (dtSeg > 0) {
+          speed = delta.subVectors(entry.pos, prevEntry.pos).length() / dtSeg;
+        }
+        prevEntry = entry;
+      }
+
+      // Width: pitch modulation, then scaled inversely with speed
+      const pitchWidth = RIBBON_BASE_WIDTH + Math.max(0, -pitch) * RIBBON_PITCH_SCALE;
+      const rawHalfWidth = pitchWidth * (RIBBON_SPEED_REF / (speed + RIBBON_SPEED_EPS));
+      const halfWidth = Math.min(RIBBON_HALF_WIDTH_MAX, Math.max(RIBBON_HALF_WIDTH_MIN, rawHalfWidth));
+
+      // Ribbon orientation follows controller's local X axis (rotated 90° from before)
+      localRight.set(1, 0, 0).applyQuaternion(entry.quat).normalize();
+
+      // Left and right vertices
+      const li = i * 2 * 3;
+      const ri = (i * 2 + 1) * 3;
+      positions[li + 0] = cx + localRight.x * halfWidth;
+      positions[li + 1] = cy + localRight.y * halfWidth;
+      positions[li + 2] = cz + localRight.z * halfWidth;
+      positions[ri + 0] = cx - localRight.x * halfWidth;
+      positions[ri + 1] = cy - localRight.y * halfWidth;
+      positions[ri + 2] = cz - localRight.z * halfWidth;
+
+      // Color for both vertices (less opaque)
+      const c0 = trailColor.r * fade * 0.35;
+      const c1 = trailColor.g * fade * 0.35;
+      const c2 = trailColor.b * fade * 0.35;
+      colors[li + 0] = c0; colors[li + 1] = c1; colors[li + 2] = c2;
+      colors[ri + 0] = c0; colors[ri + 1] = c1; colors[ri + 2] = c2;
     }
 
-    this.trailGeo.setDrawRange(0, count);
+    // Draw (count-1) quads = (count-1)*6 indices
+    this.trailGeo.setDrawRange(0, Math.max(0, (count - 1) * 6));
     this.trailGeo.attributes.position.needsUpdate = true;
     this.trailGeo.attributes.color.needsUpdate = true;
   }
@@ -523,6 +591,14 @@ class Ball {
     this.mesh.position.set(0, 0, -stackIndex * STACK_OFFSET);
     this.velocity.set(0, 0, 0);
     this.holdStartTime = performance.now();
+    // Stamp a final trail point at the catch position, then break the strip while held.
+    if (trailEnabled) {
+      const heldWorldPos = new THREE.Vector3();
+      this.mesh.getWorldPosition(heldWorldPos);
+      this.trailBuffer.push({ pos: heldWorldPos.clone(), time: performance.now() });
+      this.trailBuffer.push(null);
+      while (this.trailBuffer.length > TRAIL_LENGTH) this.trailBuffer.shift();
+    }
   }
 
   release(throwVelocity) {
@@ -643,12 +719,24 @@ class Ball {
 
     for (let i = 0; i < count; i++) {
       const entry = this.trailBuffer[i];
+
+      if (entry === null) {
+        // Break marker: NaN creates a gap in the line strip
+        positions[i * 3 + 0] = NaN;
+        positions[i * 3 + 1] = NaN;
+        positions[i * 3 + 2] = NaN;
+        colors[i * 3 + 0] = 0;
+        colors[i * 3 + 1] = 0;
+        colors[i * 3 + 2] = 0;
+        continue;
+      }
+
       const age = (now - entry.time) / 1000;
       const fade = Math.max(0, 1.0 - (age / maxAge));
 
       positions[i * 3 + 0] = entry.pos.x;
       positions[i * 3 + 1] = entry.pos.y;
-      positions[i * 3 + 2] = entry.pos.z - age * TRAIL_SCROLL_SPEED;
+      positions[i * 3 + 2] = entry.pos.z - age * trailScrollSpeed;
 
       colors[i * 3 + 0] = this.trailColor.r * fade * 0.7;
       colors[i * 3 + 1] = this.trailColor.g * fade * 0.7;
@@ -695,6 +783,7 @@ function removeBall() {
 let vrSessionActive = false;
 let lastLaunchTime = 0;
 let launchedCount = 0;
+let trailScrollSpeed = TRAIL_SCROLL_SPEED;  // scaled by total controller velocity
 
 // Ground HUD — a flat plane on the ground facing up
 const hudCanvas = document.createElement('canvas');
@@ -734,9 +823,21 @@ function updateHUD() {
 }
 updateHUD();
 
+function distributeBallsToHands() {
+  const leftCount = Math.floor(balls.length / 2);
+  const rightCount = balls.length - leftCount;
+  for (let i = 0; i < leftCount; i++) {
+    balls[i].attachTo(controllers[0]);
+  }
+  for (let i = leftCount; i < balls.length; i++) {
+    balls[i].attachTo(controllers[1]);
+  }
+}
+
 renderer.xr.addEventListener('sessionstart', () => {
   vrSessionActive = true;
-  launchedCount = 0;
+  distributeBallsToHands();
+  launchedCount = balls.length;
   lastLaunchTime = performance.now();
 });
 
@@ -998,7 +1099,7 @@ function checkAutoThrowToggle() {
     if (!trailEnabled) {
       for (const ctrl of controllers) {
         ctrl.trailBuffer.length = 0;
-        ctrl.trailLine.visible = false;
+        ctrl.trailMesh.visible = false;
       }
       for (const ball of balls) {
         ball.trailBuffer.length = 0;
@@ -1024,8 +1125,12 @@ function animate() {
     // Auto-launch balls at start of VR session
     autoLaunchBalls(now);
 
-    // Update controller velocities
+    // Update controller velocities; freeze trails when total velocity below threshold; scale scroll by total velocity
+    const totalVel = controllers[0].velocity.length() + controllers[1].velocity.length();
+    const trailsFrozen = totalVel < TRAIL_FREEZE_VELOCITY_THRESHOLD;
+    trailScrollSpeed = TRAIL_SCROLL_SPEED * (totalVel / TRAIL_VELOCITY_REF);
     for (const ctrl of controllers) {
+      ctrl.trailsFrozen = trailsFrozen;
       ctrl.updateVelocity(dt);
     }
 

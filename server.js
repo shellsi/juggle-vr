@@ -52,13 +52,17 @@ httpsServer.listen(HTTPS_PORT, '0.0.0.0', () => {
   console.log(`  Local:   https://localhost:${HTTPS_PORT}`);
 
   // Show LAN IPs
-  const nets = networkInterfaces();
-  for (const name of Object.keys(nets)) {
-    for (const net of nets[name]) {
-      if (net.family === 'IPv4' && !net.internal) {
-        console.log(`  Network: https://${net.address}:${HTTPS_PORT}`);
+  try {
+    const nets = networkInterfaces();
+    for (const name of Object.keys(nets)) {
+      for (const net of nets[name] ?? []) {
+        if (net.family === 'IPv4' && !net.internal) {
+          console.log(`  Network: https://${net.address}:${HTTPS_PORT}`);
+        }
       }
     }
+  } catch {
+    // Some restricted/sandboxed environments disallow interface enumeration.
   }
 
   console.log('');
