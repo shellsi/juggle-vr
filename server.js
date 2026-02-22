@@ -49,15 +49,16 @@ httpsServer.listen(HTTPS_PORT, '0.0.0.0', () => {
   console.log('');
   console.log('  🤹 Juggle VR — HTTPS Server');
   console.log('  ─────────────────────────────');
-  console.log(`  Local:   https://localhost:${HTTPS_PORT}`);
 
-  // Show LAN IPs
+  // Show LAN IPs — Quest needs the numeric IP (localhost = headset itself)
+  let hasNetwork = false;
   try {
     const nets = networkInterfaces();
     for (const name of Object.keys(nets)) {
       for (const net of nets[name] ?? []) {
         if (net.family === 'IPv4' && !net.internal) {
-          console.log(`  Network: https://${net.address}:${HTTPS_PORT}`);
+          console.log(`  Quest:   https://${net.address}:${HTTPS_PORT}  ← use this on headset`);
+          hasNetwork = true;
         }
       }
     }
@@ -65,8 +66,12 @@ httpsServer.listen(HTTPS_PORT, '0.0.0.0', () => {
     // Some restricted/sandboxed environments disallow interface enumeration.
   }
 
+  if (!hasNetwork) {
+    console.log('  (Run "ipconfig getifaddr en0" to find your LAN IP for Quest)');
+  }
+  console.log(`  Desktop: https://localhost:${HTTPS_PORT}`);
   console.log('');
-  console.log('  ⚠️  Your Quest 3 will show a certificate warning — tap "Advanced" → "Proceed"');
+  console.log('  ⚠️  Quest will show a certificate warning — tap "Advanced" → "Proceed"');
   console.log('  🎮 Then tap "Enter VR" to start juggling!');
   console.log('');
 });

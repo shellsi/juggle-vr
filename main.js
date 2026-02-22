@@ -39,7 +39,7 @@ let flatPlaneEnabled = true;
 
 // Smoke trail settings
 let trailEnabled = true;
-const TRAIL_LENGTH = 400;               // number of points in trail buffer
+const TRAIL_LENGTH = 800;               // number of points in trail buffer
 const TRAIL_SCROLL_SPEED = 0.5;         // m/s backward scroll
 const TRAIL_COLORS = [
   new THREE.Color(0.2, 0.8, 1.0),       // left hand: cyan
@@ -52,6 +52,7 @@ const RIBBON_SPEED_REF = 1.2;           // speed where width ~= base+pitch
 const RIBBON_SPEED_EPS = 0.08;          // avoid division blow-up near 0
 const RIBBON_HALF_WIDTH_MIN = 0.0006;   // clamp for stability (half-width)
 const RIBBON_HALF_WIDTH_MAX = 0.01;     // clamp for stability (half-width)
+const TRAIL_BEND_RADIUS = 1.0;          // meters — radius of the upward arc after 2m
 const TRAIL_FREEZE_VELOCITY_THRESHOLD = 0.15;  // m/s — freeze trails when total controller velocity below this
 const TRAIL_VELOCITY_REF = 1.0;  // m/s — scroll speed = TRAIL_SCROLL_SPEED when total velocity equals this
 
@@ -266,6 +267,12 @@ class ControllerState {
     this.previousPos = new THREE.Vector3();
     this.velocity = new THREE.Vector3();
 
+    // Angular velocity (rad/s) for ball spin transfer on release
+    this.previousQuat = new THREE.Quaternion();
+    this.previousQuatTime = 0;
+    this.hasPreviousQuat = false;
+    this.angularVelocity = new THREE.Vector3();
+
     // State
     this.heldBalls = [];
     this.gripping = false;
@@ -328,6 +335,29 @@ class ControllerState {
         this.trailBuffer.shift();
       }
     }
+
+    // Angular velocity from quaternion delta (rad/s)
+    const quat = new THREE.Quaternion();
+    this.grip.getWorldQuaternion(quat);
+    const now = performance.now();
+    if (this.hasPreviousQuat && this.previousQuatTime > 0) {
+      const dtQ = (now - this.previousQuatTime) / 1000;
+      if (dtQ > 0.0001) {
+        const qPrevInv = this.previousQuat.clone().invert();
+        const qDelta = quat.clone().multiply(qPrevInv);
+        const w = Math.max(-1, Math.min(1, qDelta.w));
+        const angle = 2 * Math.acos(w);
+        const sinHalf = Math.sqrt(1 - w * w);
+        if (sinHalf > 0.0001) {
+          this.angularVelocity.set(qDelta.x, qDelta.y, qDelta.z).divideScalar(sinHalf).multiplyScalar(angle / dtQ);
+        } else {
+          this.angularVelocity.set(0, 0, 0);
+        }
+      }
+    }
+    this.previousQuat.copy(quat);
+    this.previousQuatTime = now;
+    this.hasPreviousQuat = true;
   }
 
   updateTrail(now) {
@@ -353,10 +383,27 @@ class ControllerState {
       const age = (now - entry.time) / 1000;
       const fade = Math.max(0, 1.0 - (age / maxAge));
 
-      // Center position with Z scroll
-      const cx = entry.pos.x;
-      const cy = entry.pos.y;
-      const cz = entry.pos.z - age * trailScrollSpeed;
+      // Center position with Z scroll; bend upward via circular arc after 2m
+      const scrollDistance = age * trailScrollSpeed;
+      let cx, cy, cz;
+      
+      if (scrollDistance > 2.0) {
+        // Follow a circular arc rotating from -Z toward +Y
+        const excess = scrollDistance - 2.0;
+        const theta = Math.min(excess / TRAIL_BEND_RADIUS, Math.PI / 2);
+        cx = entry.pos.x;
+        cy = entry.pos.y + TRAIL_BEND_RADIUS * (1 - Math.cos(theta));
+        cz = entry.pos.z - 2.0 - TRAIL_BEND_RADIUS * Math.sin(theta);
+        // Continue straight up after completing the quarter turn
+        if (excess > TRAIL_BEND_RADIUS * Math.PI / 2) {
+          cy += excess - TRAIL_BEND_RADIUS * Math.PI / 2;
+        }
+      } else {
+        // Normal backward scroll for first 2m
+        cx = entry.pos.x;
+        cy = entry.pos.y;
+        cz = entry.pos.z - scrollDistance;
+      }
 
       // Extract pitch from quaternion: forward vector's Y component = sin(pitch)
       forward.set(0, 0, -1).applyQuaternion(entry.quat);
@@ -484,11 +531,49 @@ const controllers = [
 ];
 
 // ─── Balls ───────────────────────────────────────────────────────────
+function createCheckerTextures(colorHex) {
+  const size = 64;
+  const color = new THREE.Color(colorHex);
+  const hex = '#' + color.getHexString();
+
+  // Diffuse map: base color in 2 quadrants, near-black in other 2
+  const mapCanvas = document.createElement('canvas');
+  mapCanvas.width = size;
+  mapCanvas.height = size;
+  const mapCtx = mapCanvas.getContext('2d');
+  mapCtx.fillStyle = hex;
+  mapCtx.fillRect(0, 0, size / 2, size / 2);
+  mapCtx.fillRect(size / 2, size / 2, size / 2, size / 2);
+  mapCtx.fillStyle = '#000000';
+  mapCtx.fillRect(size / 2, 0, size / 2, size / 2);
+  mapCtx.fillRect(0, size / 2, size / 2, size / 2);
+
+  // Emissive map: glow only on colored quadrants so dark areas stay dark
+  const emitCanvas = document.createElement('canvas');
+  emitCanvas.width = size;
+  emitCanvas.height = size;
+  const emitCtx = emitCanvas.getContext('2d');
+  emitCtx.fillStyle = '#ffffff';
+  emitCtx.fillRect(0, 0, size / 2, size / 2);
+  emitCtx.fillRect(size / 2, size / 2, size / 2, size / 2);
+  emitCtx.fillStyle = '#000000';
+  emitCtx.fillRect(size / 2, 0, size / 2, size / 2);
+  emitCtx.fillRect(0, size / 2, size / 2, size / 2);
+
+  return {
+    map: new THREE.CanvasTexture(mapCanvas),
+    emissiveMap: new THREE.CanvasTexture(emitCanvas),
+  };
+}
+
 class Ball {
   constructor(color, index) {
     const geo = new THREE.SphereGeometry(BALL_RADIUS, 24, 18);
+    const checker = createCheckerTextures(color);
     const mat = new THREE.MeshStandardMaterial({
-      color: color,
+      map: checker.map,
+      emissiveMap: checker.emissiveMap,
+      color: 0xffffff,
       roughness: 0.3,
       metalness: 0.5,
       emissive: color,
@@ -509,6 +594,7 @@ class Ball {
     this.mesh.add(this.glow);
 
     this.velocity = new THREE.Vector3();
+    this.angularVelocity = new THREE.Vector3(); // rad/s, from controller at release
     this.state = 'waiting'; // 'waiting', 'free', 'held', 'sliding'
     this.holder = null;     // controller reference if held
     this.index = index;
@@ -548,6 +634,8 @@ class Ball {
   launch(x, y, z, vx, vy, vz) {
     this.mesh.position.set(x, y, z);
     this.velocity.set(vx, vy, vz);
+    this.angularVelocity.set(0, 0, 0);
+    this.mesh.quaternion.identity();
     this.state = 'free';
     this.holder = null;
     // Detach from any parent
@@ -589,7 +677,9 @@ class Ball {
     // Offset forward based on stack position
     const stackIndex = controller.heldBalls.indexOf(this);
     this.mesh.position.set(0, 0, -stackIndex * STACK_OFFSET);
+    this.mesh.quaternion.identity();
     this.velocity.set(0, 0, 0);
+    this.angularVelocity.set(0, 0, 0);
     this.holdStartTime = performance.now();
     // Stamp a final trail point at the catch position, then break the strip while held.
     if (trailEnabled) {
@@ -603,6 +693,7 @@ class Ball {
 
   release(throwVelocity) {
     if (this.holder) {
+      this.angularVelocity.copy(this.holder.angularVelocity);
       const idx = this.holder.heldBalls.indexOf(this);
       if (idx !== -1) this.holder.heldBalls.splice(idx, 1);
       // Reposition remaining balls in stack
@@ -663,6 +754,14 @@ class Ball {
     this.mesh.position.x += this.velocity.x * dt;
     this.mesh.position.y += this.velocity.y * dt;
 
+    // Apply angular velocity (spin from release)
+    if (this.angularVelocity.lengthSq() > 1e-12) {
+      const axis = this.angularVelocity.clone().normalize();
+      const angle = this.angularVelocity.length() * dt;
+      const deltaQ = new THREE.Quaternion().setFromAxisAngle(axis, angle);
+      this.mesh.quaternion.premultiply(deltaQ);
+    }
+
     // Flat plane: constrain Z
     if (flatPlaneEnabled) {
       this.velocity.z = 0;
@@ -678,9 +777,13 @@ class Ball {
       this.velocity.x *= 0.8;
       this.velocity.z *= 0.8;
 
-      // If very slow, just stop bouncing
+      // Friction with floor reduces spin — lose ~80% of angular velocity per bounce
+      this.angularVelocity.multiplyScalar(0.2);
+
+      // If very slow, just stop bouncing and spinning
       if (Math.abs(this.velocity.y) < 0.3) {
         this.velocity.y = 0;
+        this.angularVelocity.set(0, 0, 0);
       }
     }
 
@@ -734,9 +837,23 @@ class Ball {
       const age = (now - entry.time) / 1000;
       const fade = Math.max(0, 1.0 - (age / maxAge));
 
-      positions[i * 3 + 0] = entry.pos.x;
-      positions[i * 3 + 1] = entry.pos.y;
-      positions[i * 3 + 2] = entry.pos.z - age * trailScrollSpeed;
+      // Bend upward via circular arc after 2m (matches controller trails)
+      const scrollDistance = age * trailScrollSpeed;
+      if (scrollDistance > 2.0) {
+        const excess = scrollDistance - 2.0;
+        const theta = Math.min(excess / TRAIL_BEND_RADIUS, Math.PI / 2);
+        positions[i * 3 + 0] = entry.pos.x;
+        positions[i * 3 + 1] = entry.pos.y + TRAIL_BEND_RADIUS * (1 - Math.cos(theta));
+        positions[i * 3 + 2] = entry.pos.z - 2.0 - TRAIL_BEND_RADIUS * Math.sin(theta);
+        // Continue straight up after completing the quarter turn
+        if (excess > TRAIL_BEND_RADIUS * Math.PI / 2) {
+          positions[i * 3 + 1] += excess - TRAIL_BEND_RADIUS * Math.PI / 2;
+        }
+      } else {
+        positions[i * 3 + 0] = entry.pos.x;
+        positions[i * 3 + 1] = entry.pos.y;
+        positions[i * 3 + 2] = entry.pos.z - scrollDistance;
+      }
 
       colors[i * 3 + 0] = this.trailColor.r * fade * 0.7;
       colors[i * 3 + 1] = this.trailColor.g * fade * 0.7;
@@ -1052,7 +1169,6 @@ function checkAutoThrow(now) {
     if (ctrl.wasAcceleratingUp && nowDecelerating && ctrl.velocity.y > AUTO_THROW_MIN_VELOCITY) {
       // Auto-throw!
       topBall.release(ctrl.velocity);
-      ctrl.triggerHaptic(0.4, 80);
       ctrl.autoThrowCooldownUntil = now + AUTO_THROW_COOLDOWN_MS;
     }
 
@@ -1125,10 +1241,12 @@ function animate() {
     // Auto-launch balls at start of VR session
     autoLaunchBalls(now);
 
-    // Update controller velocities; freeze trails when total velocity below threshold; scale scroll by total velocity
+    // Update controller velocities; freeze trails when total velocity below threshold; keep scroll speed constant
     const totalVel = controllers[0].velocity.length() + controllers[1].velocity.length();
     const trailsFrozen = totalVel < TRAIL_FREEZE_VELOCITY_THRESHOLD;
-    trailScrollSpeed = TRAIL_SCROLL_SPEED * (totalVel / TRAIL_VELOCITY_REF);
+    // Keep velocity calculation but use constant scroll speed
+    // trailScrollSpeed = TRAIL_SCROLL_SPEED * (totalVel / TRAIL_VELOCITY_REF);
+    trailScrollSpeed = TRAIL_SCROLL_SPEED;
     for (const ctrl of controllers) {
       ctrl.trailsFrozen = trailsFrozen;
       ctrl.updateVelocity(dt);
