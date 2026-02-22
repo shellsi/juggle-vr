@@ -1,9 +1,10 @@
 import * as THREE from 'three';
 import { VRButton } from 'three/addons/webxr/VRButton.js';
 import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
+import { XRHandModelFactory } from 'three/addons/webxr/XRHandModelFactory.js';
 // ─── Constants ───────────────────────────────────────────────────────
 const EARTH_GRAVITY = 9.81;
-const CATCH_RADIUS = 0.09;          // 9cm catch zone around each grip
+const CATCH_RADIUS = 0.09;          // 9cm catch zone around each grip (spherical)
 const BALL_RADIUS = 0.04;           // 4cm radius juggling ball
 const STACK_OFFSET = BALL_RADIUS;    // offset per stacked ball; top (next throw) at centre, others back
 const FLOOR_Y = 0;
@@ -38,7 +39,7 @@ const ACCEL_UPSWING_THRESHOLD = 0.5;    // m/s² min accel to count as "was acce
 let flatPlaneEnabled = true;
 
 // Smoke trail settings
-let trailEnabled = true;
+let trailEnabled = false;
 const TRAIL_LENGTH = 800;               // number of points in trail buffer
 const TRAIL_SCROLL_SPEED = 0.5;         // m/s backward scroll
 const TRAIL_COLORS = [
@@ -184,9 +185,21 @@ renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.2;
 document.body.appendChild(renderer.domElement);
 
-// VR Button
-const vrButton = VRButton.createButton(renderer);
+// VR Button — request hand-tracking as optional (put down controllers for hands)
+const vrButton = VRButton.createButton(renderer, {
+  optionalFeatures: ['hand-tracking'],
+});
 document.body.appendChild(vrButton);
+
+// H key: cycle input mode (auto → hands → controllers) for switching
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'h' || e.key === 'H') {
+    const modes = ['auto', 'hands', 'controllers'];
+    const i = modes.indexOf(inputMode);
+    inputMode = modes[(i + 1) % modes.length];
+    console.log('Input mode:', inputMode);
+  }
+});
 
 // Resize
 window.addEventListener('resize', () => {
@@ -195,19 +208,31 @@ window.addEventListener('resize', () => {
   renderer.setSize(window.innerWidth, window.innerHeight);
 });
 
-// ─── Controllers ─────────────────────────────────────────────────────
+// ─── Controllers & Hands ─────────────────────────────────────────────
 const controllerModelFactory = new XRControllerModelFactory();
+const handModelFactory = new XRHandModelFactory();
+
+// Input mode: 'auto' = use whichever is active; 'hands' / 'controllers' = prefer that type
+let inputMode = 'auto';
 
 class ControllerState {
   constructor(index) {
     this.index = index;
     this.controller = renderer.xr.getController(index);
     this.grip = renderer.xr.getControllerGrip(index);
+    this.hand = renderer.xr.getHand(index);
+
     this.grip.add(controllerModelFactory.createControllerModel(this.grip));
+    this.hand.add(handModelFactory.createHandModel(this.hand, 'spheres'));
     scene.add(this.controller);
     scene.add(this.grip);
+    scene.add(this.hand);
 
-    // Catch zone visual
+    // Effective pivot for catch zone (follows grip or hand wrist)
+    this.effectiveGrip = new THREE.Group();
+    scene.add(this.effectiveGrip);
+
+    // Catch zone visual: sphere (same for controllers and hands)
     const catchZoneGeo = new THREE.SphereGeometry(CATCH_RADIUS, 16, 12);
     const catchZoneMat = new THREE.MeshBasicMaterial({
       color: 0x88aaff,
@@ -216,9 +241,9 @@ class ControllerState {
       wireframe: true,
     });
     this.catchZone = new THREE.Mesh(catchZoneGeo, catchZoneMat);
-    this.grip.add(this.catchZone);
+    this.effectiveGrip.add(this.catchZone);
 
-    // Laser pointer for trigger-grab (thin line from controller)
+    // Laser pointer for trigger-grab (thin line from controller/hand)
     const laserGeo = new THREE.BufferGeometry().setFromPoints([
       new THREE.Vector3(0, 0, 0),
       new THREE.Vector3(0, 0, -RAY_GRAB_MAX_DIST),
@@ -291,6 +316,11 @@ class ControllerState {
     this.xButtonDown = false;
     this.trailsFrozen = false;
 
+    // Hand-mode state (pinch = trigger, fist = grip)
+    this.isHandTracking = false;
+    this.handPinching = false;
+    this.handGripping = false;
+
     // Events
     this.controller.addEventListener('connected', (event) => {
       this.inputSource = event.data;
@@ -300,9 +330,77 @@ class ControllerState {
     });
   }
 
+  updateInputPose() {
+    try {
+      const useHand = (inputMode === 'hands' && this.hand && this.hand.visible) ||
+        ((inputMode === 'auto' || inputMode === 'controllers') && this.hand && this.hand.visible && this.grip && !this.grip.visible);
+      this.isHandTracking = !!useHand;
+
+      if (useHand && this.hand.joints) {
+        const knuckle = this.hand.joints['middle-finger-phalanx-proximal'] || this.hand.joints['middle-finger-metacarpal'];
+        const ref = knuckle ?? this.hand.joints['wrist'];
+        if (ref && ref.visible) {
+          if (this.effectiveGrip.parent !== ref) {
+            this.effectiveGrip.removeFromParent();
+            ref.add(this.effectiveGrip);
+          }
+          this.effectiveGrip.position.set(0, -BALL_RADIUS, 0);
+          this.effectiveGrip.quaternion.identity();
+          this.effectiveGrip.visible = true;
+          this.catchZone.visible = true;
+          this._updateHandGestures();
+        } else {
+          this.effectiveGrip.visible = false;
+        }
+      } else {
+        if (this.effectiveGrip.parent !== scene) {
+          this.effectiveGrip.removeFromParent();
+          scene.add(this.effectiveGrip);
+        }
+        if (this.grip && this.grip.visible && this.grip.matrixWorld) {
+          this.catchZone.visible = true;
+          this.effectiveGrip.matrix.copy(this.grip.matrixWorld);
+          this.effectiveGrip.matrix.decompose(
+            this.effectiveGrip.position,
+            this.effectiveGrip.quaternion,
+            this.effectiveGrip.scale
+          );
+          this.effectiveGrip.visible = true;
+        } else {
+          this.effectiveGrip.visible = false;
+        }
+      }
+    } catch (err) {
+      this.effectiveGrip.visible = false;
+      this.isHandTracking = false;
+    }
+  }
+
+  _updateHandGestures() {
+    try {
+      const hand = this.hand;
+      if (!hand || !hand.joints) return;
+      this.handPinching = !!(hand.inputState && hand.inputState.pinching);
+      const indexTip = hand.joints['index-finger-tip'];
+      const wrist = hand.joints['wrist'];
+      if (indexTip && wrist && indexTip.visible && wrist.visible &&
+          indexTip.position && wrist.position) {
+        const dist = indexTip.position.distanceTo(wrist.position);
+        this.handGripping = dist < 0.10;
+      } else {
+        this.handGripping = false;
+      }
+    } catch {
+      this.handPinching = false;
+      this.handGripping = false;
+    }
+  }
+
   updateVelocity(dt) {
+    this.updateInputPose();
+    if (!this.effectiveGrip.visible) return;
     const currentPos = new THREE.Vector3();
-    this.grip.getWorldPosition(currentPos);
+    this.effectiveGrip.getWorldPosition(currentPos);
 
     this.positionHistory.push({ pos: currentPos.clone(), time: performance.now() });
     if (this.positionHistory.length > VELOCITY_HISTORY_SIZE) {
@@ -329,7 +427,7 @@ class ControllerState {
     // Record trail position + orientation (skipped when total controller velocity below threshold)
     if (trailEnabled && !this.trailsFrozen) {
       const quat = new THREE.Quaternion();
-      this.grip.getWorldQuaternion(quat);
+      this.effectiveGrip.getWorldQuaternion(quat);
       this.trailBuffer.push({ pos: currentPos.clone(), time: performance.now(), quat: quat });
       if (this.trailBuffer.length > TRAIL_LENGTH) {
         this.trailBuffer.shift();
@@ -338,7 +436,7 @@ class ControllerState {
 
     // Angular velocity from quaternion delta (rad/s)
     const quat = new THREE.Quaternion();
-    this.grip.getWorldQuaternion(quat);
+    this.effectiveGrip.getWorldQuaternion(quat);
     const now = performance.now();
     if (this.hasPreviousQuat && this.previousQuatTime > 0) {
       const dtQ = (now - this.previousQuatTime) / 1000;
@@ -458,6 +556,7 @@ class ControllerState {
   }
 
   triggerHaptic(intensity = HAPTIC_INTENSITY, duration = HAPTIC_DURATION) {
+    if (this.isHandTracking) return;
     if (!this.inputSource || !this.inputSource.gamepad) return;
     const gp = this.inputSource.gamepad;
     if (gp.hapticActuators && gp.hapticActuators.length > 0) {
@@ -474,19 +573,22 @@ class ControllerState {
   }
 
   isSqueezing() {
+    if (this.isHandTracking) return this.handGripping;
     if (!this.inputSource || !this.inputSource.gamepad) return false;
     const gp = this.inputSource.gamepad;
-    return gp.buttons.length > 1 && gp.buttons[1].pressed; // grip/squeeze
+    return gp.buttons.length > 1 && gp.buttons[1].pressed;
   }
 
   isTriggerPressed() {
+    if (this.isHandTracking) return this.handPinching;
     if (!this.inputSource || !this.inputSource.gamepad) return false;
     const gp = this.inputSource.gamepad;
-    return gp.buttons.length > 0 && gp.buttons[0].pressed; // trigger
+    return gp.buttons.length > 0 && gp.buttons[0].pressed;
   }
 
   // Get right thumbstick Y axis (used for gravity control)
   getThumbstickY() {
+    if (this.isHandTracking) return 0;
     if (!this.inputSource || !this.inputSource.gamepad) return 0;
     const gp = this.inputSource.gamepad;
     if (gp.axes.length >= 4) return gp.axes[3];
@@ -496,6 +598,7 @@ class ControllerState {
 
   // Get right thumbstick X axis (used for ball count)
   getThumbstickX() {
+    if (this.isHandTracking) return 0;
     if (!this.inputSource || !this.inputSource.gamepad) return 0;
     const gp = this.inputSource.gamepad;
     if (gp.axes.length >= 4) return gp.axes[2];
@@ -505,6 +608,7 @@ class ControllerState {
 
   // A button (buttons[4] on Quest right, buttons[4] on left too)
   isAButtonPressed() {
+    if (this.isHandTracking) return false;
     if (!this.inputSource || !this.inputSource.gamepad) return false;
     const gp = this.inputSource.gamepad;
     return gp.buttons.length > 4 && gp.buttons[4].pressed;
@@ -512,6 +616,7 @@ class ControllerState {
 
   // B button (buttons[5] on Quest right)
   isBButtonPressed() {
+    if (this.isHandTracking) return false;
     if (!this.inputSource || !this.inputSource.gamepad) return false;
     const gp = this.inputSource.gamepad;
     return gp.buttons.length > 5 && gp.buttons[5].pressed;
@@ -519,6 +624,7 @@ class ControllerState {
 
   // X button (buttons[4] on Quest left controller)
   isXButtonPressed() {
+    if (this.isHandTracking) return false;
     if (!this.inputSource || !this.inputSource.gamepad) return false;
     const gp = this.inputSource.gamepad;
     return gp.buttons.length > 4 && gp.buttons[4].pressed;
@@ -663,7 +769,7 @@ class Ball {
     // Parent to grip so it moves with the hand
     const worldPos = new THREE.Vector3();
     this.mesh.getWorldPosition(worldPos);
-    controller.grip.attach(this.mesh);
+    controller.effectiveGrip.attach(this.mesh);
     // New ball at centre; reposition all held balls (existing ones shift back towards user)
     const n = controller.heldBalls.length;
     controller.heldBalls.forEach((b, i) => {
@@ -727,13 +833,13 @@ class Ball {
       const stackIndex = this.slideTarget.heldBalls.indexOf(this);
       const zOffset = (this.slideTarget.heldBalls.length - 1 - stackIndex) * STACK_OFFSET;
       const targetPos = new THREE.Vector3(0, 0, zOffset);
-      this.slideTarget.grip.localToWorld(targetPos);
+      this.slideTarget.effectiveGrip.localToWorld(targetPos);
       this.mesh.position.lerpVectors(this.slideStartPos, targetPos, ease);
 
       if (t >= 1.0) {
         // Arrived — snap to held and reposition all (new ball at centre, others shift back)
         this.state = 'held';
-        this.slideTarget.grip.attach(this.mesh);
+        this.slideTarget.effectiveGrip.attach(this.mesh);
         const n = this.slideTarget.heldBalls.length;
         this.slideTarget.heldBalls.forEach((b, i) => {
           const zOff = (n - 1 - i) * STACK_OFFSET;
@@ -936,7 +1042,8 @@ function updateHUD() {
   const autoLabel = autoThrowEnabled ? 'ON' : 'OFF';
   const planeLabel = flatPlaneEnabled ? 'ON' : 'OFF';
   const trailLabel = trailEnabled ? 'ON' : 'OFF';
-  hudCtx.fillText(`G:${pct}% B:${balls.length} A:${autoLabel} P:${planeLabel} T:${trailLabel}`, 256, 64);
+  const modeLabel = inputMode === 'hands' ? 'H' : inputMode === 'controllers' ? 'C' : 'A';
+  hudCtx.fillText(`G:${pct}% B:${balls.length} A:${autoLabel} P:${planeLabel} T:${trailLabel} M:${modeLabel}`, 256, 64);
   hudTexture.needsUpdate = true;
 }
 updateHUD();
@@ -984,21 +1091,23 @@ const raycaster = new THREE.Raycaster();
 const tempMatrix = new THREE.Matrix4();
 
 function checkAutoCatch() {
-  // Auto-catch: any free ball that enters a hand's catch zone is caught automatically
+  // Auto-catch: any free ball that enters a hand's catch zone is caught automatically (spherical)
   for (const ctrl of controllers) {
-    if (ctrl.heldBalls.length >= balls.length) continue; // hand is full
-    const gripPos = new THREE.Vector3();
-    ctrl.grip.getWorldPosition(gripPos);
+    if (ctrl.heldBalls.length >= balls.length) continue;
+    if (!ctrl.effectiveGrip || !ctrl.effectiveGrip.visible) continue;
+
+    const gripWorld = new THREE.Vector3();
+    ctrl.effectiveGrip.getWorldPosition(gripWorld);
 
     let closestBall = null;
     let closestDist = Infinity;
 
     for (const ball of balls) {
       if (ball.state !== 'free') continue;
-      if (performance.now() < ball.throwImmunityUntil) continue; // recently thrown, skip
+      if (performance.now() < ball.throwImmunityUntil) continue;
       const ballPos = new THREE.Vector3();
       ball.mesh.getWorldPosition(ballPos);
-      const dist = gripPos.distanceTo(ballPos);
+      const dist = gripWorld.distanceTo(ballPos);
       if (dist < CATCH_RADIUS && dist < closestDist) {
         closestDist = dist;
         closestBall = ball;
@@ -1043,10 +1152,10 @@ function checkTriggerGrab() {
     const triggerPressed = ctrl.isTriggerPressed();
 
     // Show/hide laser when trigger is held
-    ctrl.laser.visible = triggerPressed && ctrl.heldBalls.length < balls.length;
+    if (ctrl.laser) ctrl.laser.visible = triggerPressed && ctrl.heldBalls.length < balls.length;
 
     // Continuously check while trigger is held
-    if (triggerPressed && ctrl.heldBalls.length < balls.length) {
+    if (triggerPressed && ctrl.heldBalls.length < balls.length && ctrl.controller?.matrixWorld) {
       // Raycast from controller
       tempMatrix.identity().extractRotation(ctrl.controller.matrixWorld);
       const rayOrigin = new THREE.Vector3();
@@ -1229,11 +1338,12 @@ function animate() {
   const now = performance.now();
 
   if (vrSessionActive) {
+    try {
     // Auto-launch balls at start of VR session
     autoLaunchBalls(now);
 
     // Update controller velocities; freeze trails when total velocity below threshold; keep scroll speed constant
-    const totalVel = controllers[0].velocity.length() + controllers[1].velocity.length();
+    const totalVel = (controllers[0]?.velocity?.length() ?? 0) + (controllers[1]?.velocity?.length() ?? 0);
     const trailsFrozen = totalVel < TRAIL_FREEZE_VELOCITY_THRESHOLD;
     // Keep velocity calculation but use constant scroll speed
     // trailScrollSpeed = TRAIL_SCROLL_SPEED * (totalVel / TRAIL_VELOCITY_REF);
@@ -1265,7 +1375,10 @@ function animate() {
 
     // Update smoke trails
     for (const ctrl of controllers) {
-      ctrl.updateTrail(now);
+      try { ctrl.updateTrail?.(now); } catch (_) {}
+    }
+    } catch (err) {
+      console.warn('VR update error:', err);
     }
   }
 
