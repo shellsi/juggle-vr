@@ -5,7 +5,7 @@ import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFa
 const EARTH_GRAVITY = 9.81;
 const CATCH_RADIUS = 0.09;          // 9cm catch zone around each grip
 const BALL_RADIUS = 0.04;           // 4cm radius juggling ball
-const STACK_OFFSET = BALL_RADIUS;    // forward offset per stacked ball (overlaps by radius)
+const STACK_OFFSET = BALL_RADIUS;    // offset per stacked ball; top (next throw) at centre, others back
 const FLOOR_Y = 0;
 const BALL_RESET_Y = -0.5;          // Reset balls that fall below floor
 const HAPTIC_INTENSITY = 0.6;
@@ -583,16 +583,6 @@ class Ball {
     this.mesh.castShadow = true;
     scene.add(this.mesh);
 
-    // Glow
-    const glowGeo = new THREE.SphereGeometry(BALL_RADIUS * 1.5, 16, 12);
-    const glowMat = new THREE.MeshBasicMaterial({
-      color: color,
-      transparent: true,
-      opacity: 0.12,
-    });
-    this.glow = new THREE.Mesh(glowGeo, glowMat);
-    this.mesh.add(this.glow);
-
     this.velocity = new THREE.Vector3();
     this.angularVelocity = new THREE.Vector3(); // rad/s, from controller at release
     this.state = 'waiting'; // 'waiting', 'free', 'held', 'sliding'
@@ -674,9 +664,12 @@ class Ball {
     const worldPos = new THREE.Vector3();
     this.mesh.getWorldPosition(worldPos);
     controller.grip.attach(this.mesh);
-    // Offset forward based on stack position
-    const stackIndex = controller.heldBalls.indexOf(this);
-    this.mesh.position.set(0, 0, -stackIndex * STACK_OFFSET);
+    // New ball at centre; reposition all held balls (existing ones shift back towards user)
+    const n = controller.heldBalls.length;
+    controller.heldBalls.forEach((b, i) => {
+      const zOffset = (n - 1 - i) * STACK_OFFSET;
+      b.mesh.position.set(0, 0, zOffset);
+    });
     this.mesh.quaternion.identity();
     this.velocity.set(0, 0, 0);
     this.angularVelocity.set(0, 0, 0);
@@ -696,9 +689,11 @@ class Ball {
       this.angularVelocity.copy(this.holder.angularVelocity);
       const idx = this.holder.heldBalls.indexOf(this);
       if (idx !== -1) this.holder.heldBalls.splice(idx, 1);
-      // Reposition remaining balls in stack
+      // Reposition remaining balls in stack (top at centre, others back)
+      const n = this.holder.heldBalls.length;
       this.holder.heldBalls.forEach((b, i) => {
-        b.mesh.position.set(0, 0, -i * STACK_OFFSET);
+        const zOffset = (n - 1 - i) * STACK_OFFSET;
+        b.mesh.position.set(0, 0, zOffset);
       });
     }
     const worldPos = new THREE.Vector3();
@@ -728,23 +723,24 @@ class Ball {
       // Smooth ease-out
       const ease = 1 - Math.pow(1 - t, 3);
 
-      // Slide toward the stacked position (offset forward from grip)
+      // Slide toward the stacked position (top at centre, others back)
       const stackIndex = this.slideTarget.heldBalls.indexOf(this);
-      const targetPos = new THREE.Vector3(0, 0, -stackIndex * STACK_OFFSET);
+      const zOffset = (this.slideTarget.heldBalls.length - 1 - stackIndex) * STACK_OFFSET;
+      const targetPos = new THREE.Vector3(0, 0, zOffset);
       this.slideTarget.grip.localToWorld(targetPos);
       this.mesh.position.lerpVectors(this.slideStartPos, targetPos, ease);
 
       if (t >= 1.0) {
-        // Arrived — snap to held
+        // Arrived — snap to held and reposition all (new ball at centre, others shift back)
         this.state = 'held';
         this.slideTarget.grip.attach(this.mesh);
-        this.mesh.position.set(0, 0, -stackIndex * STACK_OFFSET);
+        const n = this.slideTarget.heldBalls.length;
+        this.slideTarget.heldBalls.forEach((b, i) => {
+          const zOff = (n - 1 - i) * STACK_OFFSET;
+          b.mesh.position.set(0, 0, zOff);
+        });
         this.slideTarget = null;
       }
-
-      // Glow pulse
-      const gt = performance.now() * 0.003 + this.index * 2;
-      this.glow.material.opacity = 0.08 + Math.sin(gt) * 0.04;
       return;
     }
 
@@ -793,10 +789,6 @@ class Ball {
         Math.abs(this.mesh.position.z) > 10) {
       this.resetToSpawn();
     }
-
-    // Glow pulse
-    const t = performance.now() * 0.003 + this.index * 2;
-    this.glow.material.opacity = 0.08 + Math.sin(t) * 0.04;
 
     // Record trail position (only in flight, not resting on ground)
     const isMoving = this.velocity.lengthSq() > 0.1;
@@ -902,7 +894,18 @@ let lastLaunchTime = 0;
 let launchedCount = 0;
 let trailScrollSpeed = TRAIL_SCROLL_SPEED;  // scaled by total controller velocity
 
-// Ground HUD — a flat plane on the ground facing up
+// Ground HUD — compact info panel on ground
+function clearTrailBuffers() {
+  for (const ctrl of controllers) {
+    ctrl.trailBuffer.length = 0;
+    ctrl.trailMesh.visible = false;
+  }
+  for (const ball of balls) {
+    ball.trailBuffer.length = 0;
+    ball.trailLine.visible = false;
+  }
+}
+
 const hudCanvas = document.createElement('canvas');
 hudCanvas.width = 512;
 hudCanvas.height = 128;
@@ -916,17 +919,15 @@ const hudMat = new THREE.MeshBasicMaterial({
   side: THREE.DoubleSide,
 });
 const hudMesh = new THREE.Mesh(hudGeo, hudMat);
-hudMesh.rotation.x = -Math.PI / 2; // face up
-hudMesh.position.set(0, FLOOR_Y + 0.005, -0.6); // on ground, slightly in front
+hudMesh.rotation.x = -Math.PI / 2;
+hudMesh.position.set(0, FLOOR_Y + 0.005, -0.6);
 scene.add(hudMesh);
 
 function updateHUD() {
   hudCtx.clearRect(0, 0, 512, 128);
-  // Background
   hudCtx.fillStyle = 'rgba(10, 10, 30, 0.7)';
   hudCtx.roundRect(4, 4, 504, 120, 16);
   hudCtx.fill();
-  // Text
   hudCtx.fillStyle = '#ffffff';
   hudCtx.font = 'bold 36px sans-serif';
   hudCtx.textAlign = 'center';
@@ -1211,17 +1212,7 @@ function checkAutoThrowToggle() {
   if (xPressed && !leftCtrl.xButtonDown) {
     leftCtrl.xButtonDown = true;
     trailEnabled = !trailEnabled;
-    // Clear trail buffers when disabling
-    if (!trailEnabled) {
-      for (const ctrl of controllers) {
-        ctrl.trailBuffer.length = 0;
-        ctrl.trailMesh.visible = false;
-      }
-      for (const ball of balls) {
-        ball.trailBuffer.length = 0;
-        ball.trailLine.visible = false;
-      }
-    }
+    if (!trailEnabled) clearTrailBuffers();
     updateHUD();
     leftCtrl.triggerHaptic(0.2, 50);
   }

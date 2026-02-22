@@ -89,6 +89,19 @@ Constants: `TRAIL_LENGTH` 400, `TRAIL_SCROLL_SPEED` 0.5 m/s, ribbon width clamps
 
 ---
 
+## Future Enhancements
+
+- **Super Hot–style slow-mo time** — Time slows when you slow down
+- **Start with balls in hands** — Balls begin held, no auto-launch (implemented)
+- **Balls stack backwards from centre** — Top ball (next to throw) at centre, others back (implemented)
+- **Pass-through mixed reality** — See real room while juggling
+- **Clubs** — Juggling clubs instead of (or in addition to) balls
+- **Hand tracking (open/close)** — Natural grip via hand pose, no controller
+- **Rotational velocity** — Spin transfer from hands to balls (implemented)
+- **Bounce juggling** — Balls bounce off floor between catches
+
+---
+
 ## Running
 
 ```bash
