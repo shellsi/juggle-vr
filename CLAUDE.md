@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Live Site
+
+Published at: **https://shellsi.github.io/juggle-vr/**
+
 ## Development Server
 
 Start the local server for VR development:
@@ -61,6 +65,9 @@ This is a VR juggling application built with vanilla ES modules and Three.js, ta
 | **Right stick Y** | Adjust gravity (10%–100%) |
 | **Right stick X** | Add/remove balls (1–9) |
 | **Left X** | Toggle smoke trails |
+| **H** (keyboard) | Cycle input mode: Auto / Hands / Controllers |
+
+**Hand tracking** (put down controllers): pinch = trigger/grab, fist = grip/hold. No haptics, thumbstick, or A/B/X.
 
 ### Key Constants
 

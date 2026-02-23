@@ -4,17 +4,16 @@ import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFa
 import { XRHandModelFactory } from 'three/addons/webxr/XRHandModelFactory.js';
 // ─── Constants ───────────────────────────────────────────────────────
 const EARTH_GRAVITY = 9.81;
-const CATCH_RADIUS = 0.09;          // 9cm catch zone around each grip (spherical)
-const BALL_RADIUS = 0.04;           // 4cm radius juggling ball
+const CATCH_RADIUS = 0.08;          // 8cm catch zone around each grip (spherical)
+const BALL_RADIUS = 0.035;          // 3.5cm radius = 7cm diameter
 const STACK_OFFSET = BALL_RADIUS;    // offset per stacked ball; top (next throw) at centre, others back
 const FLOOR_Y = 0;
 const BALL_RESET_Y = -0.5;          // Reset balls that fall below floor
 const HAPTIC_INTENSITY = 0.6;
 const HAPTIC_DURATION = 100;         // ms
-const VELOCITY_HISTORY_SIZE = 10;    // frames to average for throw velocity
+const VELOCITY_HISTORY_SIZE = 6;    // frames to average for throw velocity
 const THROW_VELOCITY_SCALE = 1.2;    // multiplier for throw feel
 const MIN_THROW_UP = 1.5;           // minimum upward velocity on throw
-const CASCADE_INTERVAL = 0.25;      // seconds between auto-launch balls
 const THROW_IMMUNITY_MS = 300;      // ms after throw before ball can be re-caught
 const GRAVITY_MIN = 0.1;
 const GRAVITY_MAX = 1.0;
@@ -43,8 +42,8 @@ let trailEnabled = false;
 const TRAIL_LENGTH = 800;               // number of points in trail buffer
 const TRAIL_SCROLL_SPEED = 0.5;         // m/s backward scroll
 const TRAIL_COLORS = [
-  new THREE.Color(0.2, 0.8, 1.0),       // left hand: cyan
-  new THREE.Color(1.0, 0.5, 0.2),       // right hand: orange
+  new THREE.Color(0.25, 0.25, 0.25),   // left hand: dark grey
+  new THREE.Color(0.25, 0.25, 0.25),   // right hand: dark grey
 ];
 const RIBBON_BASE_WIDTH = 0.002;        // base half-width of ribbon (5mm)
 const RIBBON_PITCH_SCALE = 0.03;        // extra half-width per radian of pitch
@@ -53,7 +52,6 @@ const RIBBON_SPEED_REF = 1.2;           // speed where width ~= base+pitch
 const RIBBON_SPEED_EPS = 0.08;          // avoid division blow-up near 0
 const RIBBON_HALF_WIDTH_MIN = 0.0006;   // clamp for stability (half-width)
 const RIBBON_HALF_WIDTH_MAX = 0.01;     // clamp for stability (half-width)
-const TRAIL_BEND_RADIUS = 1.0;          // meters — radius of the upward arc after 2m
 const TRAIL_FREEZE_VELOCITY_THRESHOLD = 0.15;  // m/s — freeze trails when total controller velocity below this
 const TRAIL_VELOCITY_REF = 1.0;  // m/s — scroll speed = TRAIL_SCROLL_SPEED when total velocity equals this
 
@@ -211,6 +209,7 @@ window.addEventListener('resize', () => {
 // ─── Controllers & Hands ─────────────────────────────────────────────
 const controllerModelFactory = new XRControllerModelFactory();
 const handModelFactory = new XRHandModelFactory();
+handModelFactory.setPath('https://cdn.jsdelivr.net/npm/@webxr-input-profiles/assets@1.0/dist/profiles/generic-hand/');
 
 // Input mode: 'auto' = use whichever is active; 'hands' / 'controllers' = prefer that type
 let inputMode = 'auto';
@@ -223,7 +222,7 @@ class ControllerState {
     this.hand = renderer.xr.getHand(index);
 
     this.grip.add(controllerModelFactory.createControllerModel(this.grip));
-    this.hand.add(handModelFactory.createHandModel(this.hand, 'spheres'));
+    this.hand.add(handModelFactory.createHandModel(this.hand, 'mesh'));
     scene.add(this.controller);
     scene.add(this.grip);
     scene.add(this.hand);
@@ -241,6 +240,7 @@ class ControllerState {
       wireframe: true,
     });
     this.catchZone = new THREE.Mesh(catchZoneGeo, catchZoneMat);
+    this.catchZone.visible = false;
     this.effectiveGrip.add(this.catchZone);
 
     // Laser pointer for trigger-grab (thin line from controller/hand)
@@ -347,7 +347,7 @@ class ControllerState {
           this.effectiveGrip.position.set(0, -BALL_RADIUS, 0);
           this.effectiveGrip.quaternion.identity();
           this.effectiveGrip.visible = true;
-          this.catchZone.visible = true;
+          this.catchZone.visible = false;
           this._updateHandGestures();
         } else {
           this.effectiveGrip.visible = false;
@@ -358,13 +358,15 @@ class ControllerState {
           scene.add(this.effectiveGrip);
         }
         if (this.grip && this.grip.visible && this.grip.matrixWorld) {
-          this.catchZone.visible = true;
+          this.catchZone.visible = false;
           this.effectiveGrip.matrix.copy(this.grip.matrixWorld);
           this.effectiveGrip.matrix.decompose(
             this.effectiveGrip.position,
             this.effectiveGrip.quaternion,
             this.effectiveGrip.scale
           );
+          const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(this.effectiveGrip.quaternion);
+          this.effectiveGrip.position.addScaledVector(forward, 0.02);
           this.effectiveGrip.visible = true;
         } else {
           this.effectiveGrip.visible = false;
@@ -481,27 +483,10 @@ class ControllerState {
       const age = (now - entry.time) / 1000;
       const fade = Math.max(0, 1.0 - (age / maxAge));
 
-      // Center position with Z scroll; bend upward via circular arc after 2m
       const scrollDistance = age * trailScrollSpeed;
-      let cx, cy, cz;
-      
-      if (scrollDistance > 2.0) {
-        // Follow a circular arc rotating from -Z toward +Y
-        const excess = scrollDistance - 2.0;
-        const theta = Math.min(excess / TRAIL_BEND_RADIUS, Math.PI / 2);
-        cx = entry.pos.x;
-        cy = entry.pos.y + TRAIL_BEND_RADIUS * (1 - Math.cos(theta));
-        cz = entry.pos.z - 2.0 - TRAIL_BEND_RADIUS * Math.sin(theta);
-        // Continue straight up after completing the quarter turn
-        if (excess > TRAIL_BEND_RADIUS * Math.PI / 2) {
-          cy += excess - TRAIL_BEND_RADIUS * Math.PI / 2;
-        }
-      } else {
-        // Normal backward scroll for first 2m
-        cx = entry.pos.x;
-        cy = entry.pos.y;
-        cz = entry.pos.z - scrollDistance;
-      }
+      const cx = entry.pos.x;
+      const cy = entry.pos.y;
+      const cz = entry.pos.z - scrollDistance;
 
       // Extract pitch from quaternion: forward vector's Y component = sin(pitch)
       forward.set(0, 0, -1).applyQuaternion(entry.quat);
@@ -541,10 +526,10 @@ class ControllerState {
       positions[ri + 1] = cy - localRight.y * halfWidth;
       positions[ri + 2] = cz - localRight.z * halfWidth;
 
-      // Color for both vertices (less opaque)
-      const c0 = trailColor.r * fade * 0.35;
-      const c1 = trailColor.g * fade * 0.35;
-      const c2 = trailColor.b * fade * 0.35;
+      // Color for both vertices (light grey, 0.3 opacity)
+      const c0 = trailColor.r * fade * 0.3;
+      const c1 = trailColor.g * fade * 0.3;
+      const c2 = trailColor.b * fade * 0.3;
       colors[li + 0] = c0; colors[li + 1] = c1; colors[li + 2] = c2;
       colors[ri + 0] = c0; colors[ri + 1] = c1; colors[ri + 2] = c2;
     }
@@ -935,23 +920,10 @@ class Ball {
       const age = (now - entry.time) / 1000;
       const fade = Math.max(0, 1.0 - (age / maxAge));
 
-      // Bend upward via circular arc after 2m (matches controller trails)
       const scrollDistance = age * trailScrollSpeed;
-      if (scrollDistance > 2.0) {
-        const excess = scrollDistance - 2.0;
-        const theta = Math.min(excess / TRAIL_BEND_RADIUS, Math.PI / 2);
-        positions[i * 3 + 0] = entry.pos.x;
-        positions[i * 3 + 1] = entry.pos.y + TRAIL_BEND_RADIUS * (1 - Math.cos(theta));
-        positions[i * 3 + 2] = entry.pos.z - 2.0 - TRAIL_BEND_RADIUS * Math.sin(theta);
-        // Continue straight up after completing the quarter turn
-        if (excess > TRAIL_BEND_RADIUS * Math.PI / 2) {
-          positions[i * 3 + 1] += excess - TRAIL_BEND_RADIUS * Math.PI / 2;
-        }
-      } else {
-        positions[i * 3 + 0] = entry.pos.x;
-        positions[i * 3 + 1] = entry.pos.y;
-        positions[i * 3 + 2] = entry.pos.z - scrollDistance;
-      }
+      positions[i * 3 + 0] = entry.pos.x;
+      positions[i * 3 + 1] = entry.pos.y;
+      positions[i * 3 + 2] = entry.pos.z - scrollDistance;
 
       colors[i * 3 + 0] = this.trailColor.r * fade * 0.7;
       colors[i * 3 + 1] = this.trailColor.g * fade * 0.7;
@@ -977,30 +949,47 @@ function addBall() {
   const idx = balls.length;
   const ball = new Ball(BALL_COLORS[idx], idx);
   balls.push(ball);
-  // Drop in front of player with random X offset
-  const xOff = (Math.random() - 0.5) * 0.2; // ±10cm
-  ball.launch(xOff, 1.2, -0.4, 0, 0.5, 0);
+  if (vrSessionActive && controllers.length >= 2) {
+    const leftCount = controllers[0].heldBalls.length;
+    const rightCount = controllers[1].heldBalls.length;
+    const ctrl = rightCount <= leftCount ? controllers[1] : controllers[0];
+    ball.attachTo(ctrl);
+  } else {
+    const xOff = (Math.random() - 0.5) * 0.2;
+    ball.launch(xOff, 1.2, -0.4, 0, 0.5, 0);
+  }
 }
 
 function removeBall() {
   if (balls.length <= MIN_BALLS) return;
   const ball = balls.pop();
-  // If held, remove from controller
-  if (ball.holder) {
-    const idx = ball.holder.heldBalls.indexOf(ball);
-    if (idx !== -1) ball.holder.heldBalls.splice(idx, 1);
+
+  if (ball.state === 'held' && ball.holder) {
+    const ctrl = ball.holder;
+    const idx = ctrl.heldBalls.indexOf(ball);
+    if (idx !== -1) ctrl.heldBalls.splice(idx, 1);
+    ball.holder = null;
+    const n = ctrl.heldBalls.length;
+    ctrl.heldBalls.forEach((b, i) => {
+      const zOffset = (n - 1 - i) * STACK_OFFSET;
+      b.mesh.position.set(0, 0, zOffset);
+    });
+  } else if (ball.state === 'sliding' && ball.slideTarget) {
+    const ctrl = ball.slideTarget;
+    const idx = ctrl.heldBalls.indexOf(ball);
+    if (idx !== -1) ctrl.heldBalls.splice(idx, 1);
+    ball.slideTarget = null;
+    ball.holder = null;
   }
-  scene.remove(ball.mesh);
+  ball.mesh.parent?.remove(ball.mesh);
   scene.remove(ball.trailLine);
 }
 
 // ─── Game Logic ──────────────────────────────────────────────────────
 let vrSessionActive = false;
-let lastLaunchTime = 0;
-let launchedCount = 0;
 let trailScrollSpeed = TRAIL_SCROLL_SPEED;  // scaled by total controller velocity
 
-// Ground HUD — compact info panel on ground
+// Ground HUD — info panel on ground
 function clearTrailBuffers() {
   for (const ctrl of controllers) {
     ctrl.trailBuffer.length = 0;
@@ -1013,37 +1002,69 @@ function clearTrailBuffers() {
 }
 
 const hudCanvas = document.createElement('canvas');
-hudCanvas.width = 512;
-hudCanvas.height = 128;
+hudCanvas.width = 768;
+hudCanvas.height = 256;
 const hudCtx = hudCanvas.getContext('2d');
 const hudTexture = new THREE.CanvasTexture(hudCanvas);
-const hudGeo = new THREE.PlaneGeometry(0.5, 0.125);
+const hudGeo = new THREE.PlaneGeometry(0.96, 0.32);
 const hudMat = new THREE.MeshBasicMaterial({
   map: hudTexture,
   transparent: true,
-  opacity: 0.85,
+  opacity: 0.9,
   side: THREE.DoubleSide,
 });
 const hudMesh = new THREE.Mesh(hudGeo, hudMat);
 hudMesh.rotation.x = -Math.PI / 2;
-hudMesh.position.set(0, FLOOR_Y + 0.005, -0.6);
+hudMesh.position.set(0, FLOOR_Y + 0.002, -0.6);
 scene.add(hudMesh);
 
+// HUD ray interaction removed — use thumbstick (right) and buttons (A/B/X) for reliable control
+
 function updateHUD() {
-  hudCtx.clearRect(0, 0, 512, 128);
-  hudCtx.fillStyle = 'rgba(10, 10, 30, 0.7)';
-  hudCtx.roundRect(4, 4, 504, 120, 16);
+  const W = 768;
+  const H = 256;
+  hudCtx.clearRect(0, 0, W, H);
+  hudCtx.fillStyle = 'rgba(12, 12, 35, 0.88)';
+  hudCtx.roundRect(8, 8, W - 16, H - 16, 20);
   hudCtx.fill();
-  hudCtx.fillStyle = '#ffffff';
-  hudCtx.font = 'bold 36px sans-serif';
-  hudCtx.textAlign = 'center';
-  hudCtx.textBaseline = 'middle';
+  hudCtx.strokeStyle = 'rgba(80, 120, 200, 0.4)';
+  hudCtx.lineWidth = 2;
+  hudCtx.stroke();
+
   const pct = Math.round(gravityMultiplier * 100);
   const autoLabel = autoThrowEnabled ? 'ON' : 'OFF';
   const planeLabel = flatPlaneEnabled ? 'ON' : 'OFF';
   const trailLabel = trailEnabled ? 'ON' : 'OFF';
-  const modeLabel = inputMode === 'hands' ? 'H' : inputMode === 'controllers' ? 'C' : 'A';
-  hudCtx.fillText(`G:${pct}% B:${balls.length} A:${autoLabel} P:${planeLabel} T:${trailLabel} M:${modeLabel}`, 256, 64);
+
+  hudCtx.fillStyle = 'rgba(255,255,255,0.5)';
+  hudCtx.font = '600 18px sans-serif';
+  hudCtx.textAlign = 'center';
+  hudCtx.textBaseline = 'middle';
+
+  const leftCol1 = W * 0.15;
+  const leftCol2 = W * 0.32;
+  const rightCol1 = W * 0.52;
+  const rightCol2 = W * 0.68;
+  const rightCol3 = W * 0.85;
+  const row1 = H * 0.35;
+  const row2 = H * 0.65;
+
+  hudCtx.fillText('AUTO-THROW', leftCol1, row1 - 28);
+  hudCtx.fillText('FLAT PLANE', leftCol2, row1 - 28);
+  hudCtx.fillText('GRAVITY ↕', rightCol1, row1 - 28);
+  hudCtx.fillText('BALLS ↔', rightCol2, row1 - 28);
+  hudCtx.fillText('TRAILS', rightCol3, row2 - 28);
+
+  hudCtx.fillStyle = '#ffffff';
+  hudCtx.font = 'bold 42px sans-serif';
+  hudCtx.fillText(autoLabel, leftCol1, row1 + 6);
+  hudCtx.fillText(planeLabel, leftCol2, row1 + 6);
+  hudCtx.fillText(`${pct}%`, rightCol1, row1 + 6);
+  hudCtx.fillText(`${balls.length}`, rightCol2, row1 + 6);
+  hudCtx.fillText(trailLabel, rightCol3, row2 + 6);
+  hudCtx.font = '12px sans-serif';
+  hudCtx.fillStyle = 'rgba(255,255,255,0.35)';
+  hudCtx.fillText('Right stick ↕↔: Gravity + Balls | Left X: Auto-throw | Left Y: Flat plane | Right A: Trails', W / 2, H - 18);
   hudTexture.needsUpdate = true;
 }
 updateHUD();
@@ -1062,29 +1083,11 @@ function distributeBallsToHands() {
 renderer.xr.addEventListener('sessionstart', () => {
   vrSessionActive = true;
   distributeBallsToHands();
-  launchedCount = balls.length;
-  lastLaunchTime = performance.now();
 });
 
 renderer.xr.addEventListener('sessionend', () => {
   vrSessionActive = false;
 });
-
-function autoLaunchBalls(now) {
-  if (launchedCount >= balls.length) return;
-  const elapsed = (now - lastLaunchTime) / 1000;
-  if (elapsed >= CASCADE_INTERVAL) {
-    const ball = balls[launchedCount];
-    const xOffset = (launchedCount - 1) * 0.2;
-    const side = launchedCount % 2 === 0 ? -1 : 1;
-    ball.launch(
-      xOffset, 0.8, -0.3,
-      side * 0.8, 4.0 + launchedCount * 0.3, 0
-    );
-    launchedCount++;
-    lastLaunchTime = now;
-  }
-}
 
 // Raycaster for trigger-grab
 const raycaster = new THREE.Raycaster();
@@ -1118,8 +1121,6 @@ function checkAutoCatch() {
       closestBall.attachTo(ctrl);
       ctrl.triggerHaptic();
       // Flash the catch zone
-      ctrl.catchZone.material.opacity = 0.3;
-      setTimeout(() => { ctrl.catchZone.material.opacity = 0.08; }, 150);
     }
   }
 }
@@ -1147,31 +1148,39 @@ function checkThrowOnGripRelease() {
 }
 
 function checkTriggerGrab() {
-  // Trigger-grab: point at a ball while trigger held to summon it
   for (const ctrl of controllers) {
-    const triggerPressed = ctrl.isTriggerPressed();
+    if (!ctrl) continue;
+    const triggerPressed = ctrl.isTriggerPressed?.() ?? false;
+    const src = ctrl.controller?.matrixWorld ?? ctrl.effectiveGrip?.matrixWorld;
+    if (src) tempMatrix.identity().extractRotation(src);
+    else tempMatrix.identity();
+    const forward = new THREE.Vector3(0, 0, -1).applyMatrix4(tempMatrix);
+    const pointingDown = forward.y < -0.2;
 
-    // Show/hide laser when trigger is held
-    if (ctrl.laser) ctrl.laser.visible = triggerPressed && ctrl.heldBalls.length < balls.length;
+    if (ctrl.laser) {
+      ctrl.laser.visible = (triggerPressed && ctrl.heldBalls.length < balls.length) || pointingDown;
+      ctrl.laser.material.opacity = triggerPressed ? 0.7 : 0.15;
+    }
 
-    // Continuously check while trigger is held
-    if (triggerPressed && ctrl.heldBalls.length < balls.length && ctrl.controller?.matrixWorld) {
-      // Raycast from controller
-      tempMatrix.identity().extractRotation(ctrl.controller.matrixWorld);
+    const hasSlidingToMe = balls.some(b => b.state === 'sliding' && b.slideTarget === ctrl);
+    const canFetch = !hasSlidingToMe && ctrl.heldBalls.length < balls.length && (ctrl.controller?.matrixWorld || ctrl.effectiveGrip?.matrixWorld);
+    if ((triggerPressed || pointingDown) && canFetch) {
+      tempMatrix.identity().extractRotation(ctrl.controller?.matrixWorld ?? ctrl.effectiveGrip?.matrixWorld);
       const rayOrigin = new THREE.Vector3();
-      ctrl.controller.getWorldPosition(rayOrigin);
+      (ctrl.controller ?? ctrl.effectiveGrip).getWorldPosition(rayOrigin);
       const rayDir = new THREE.Vector3(0, 0, -1).applyMatrix4(tempMatrix).normalize();
 
-      // Find closest ball to the ray
       let bestBall = null;
       let bestDist = Infinity;
+      const groundThreshold = FLOOR_Y + BALL_RADIUS + 0.05;
 
       for (const ball of balls) {
         if (ball.state !== 'free') continue;
         const ballPos = new THREE.Vector3();
         ball.mesh.getWorldPosition(ballPos);
 
-        // Distance from ray to ball center
+        if (!triggerPressed && ballPos.y > groundThreshold) continue;
+
         const toBall = ballPos.clone().sub(rayOrigin);
         const projLen = toBall.dot(rayDir);
         if (projLen < 0 || projLen > RAY_GRAB_MAX_DIST) continue;
@@ -1276,7 +1285,7 @@ function checkAutoThrow(now) {
     // Detect zero-crossing: was accelerating up, now decelerating
     const nowDecelerating = ctrl.smoothedAccelY < 0;
 
-    if (ctrl.wasAcceleratingUp && nowDecelerating && ctrl.velocity.y > AUTO_THROW_MIN_VELOCITY) {
+    if (ctrl.wasAcceleratingUp && nowDecelerating && ctrl.velocity.lengthSq() > 0.3) {
       // Auto-throw!
       topBall.release(ctrl.velocity);
       ctrl.autoThrowCooldownUntil = now + AUTO_THROW_COOLDOWN_MS;
@@ -1288,45 +1297,40 @@ function checkAutoThrow(now) {
 }
 
 function checkAutoThrowToggle() {
-  // Right controller A-button toggles auto-throw, B-button toggles flat plane
+  const leftCtrl = controllers[0];
   const rightCtrl = controllers[1];
 
-  // A button: auto-throw
+  // Left X: auto-throw
+  const xPressed = leftCtrl.isXButtonPressed();
+  if (xPressed && !leftCtrl.xButtonDown) {
+    leftCtrl.xButtonDown = true;
+    autoThrowEnabled = !autoThrowEnabled;
+    updateHUD();
+    leftCtrl.triggerHaptic(0.2, 50);
+  }
+  if (!xPressed) leftCtrl.xButtonDown = false;
+
+  // Left Y: flat plane
+  const leftBPressed = leftCtrl.isBButtonPressed();
+  if (leftBPressed && !leftCtrl.bButtonDown) {
+    leftCtrl.bButtonDown = true;
+    flatPlaneEnabled = !flatPlaneEnabled;
+    updateHUD();
+    leftCtrl.triggerHaptic(0.2, 50);
+  }
+  if (!leftBPressed) leftCtrl.bButtonDown = false;
+
+  // Right A: toggle trails
   const aPressed = rightCtrl.isAButtonPressed();
   if (aPressed && !rightCtrl.aButtonDown) {
     rightCtrl.aButtonDown = true;
-    autoThrowEnabled = !autoThrowEnabled;
+    trailEnabled = !trailEnabled;
+    if (!trailEnabled) clearTrailBuffers();
     updateHUD();
     rightCtrl.triggerHaptic(0.2, 50);
   }
   if (!aPressed && rightCtrl.aButtonDown) {
     rightCtrl.aButtonDown = false;
-  }
-
-  // B button: flat plane
-  const bPressed = rightCtrl.isBButtonPressed();
-  if (bPressed && !rightCtrl.bButtonDown) {
-    rightCtrl.bButtonDown = true;
-    flatPlaneEnabled = !flatPlaneEnabled;
-    updateHUD();
-    rightCtrl.triggerHaptic(0.2, 50);
-  }
-  if (!bPressed && rightCtrl.bButtonDown) {
-    rightCtrl.bButtonDown = false;
-  }
-
-  // X button on left controller: toggle trails
-  const leftCtrl = controllers[0];
-  const xPressed = leftCtrl.isXButtonPressed();
-  if (xPressed && !leftCtrl.xButtonDown) {
-    leftCtrl.xButtonDown = true;
-    trailEnabled = !trailEnabled;
-    if (!trailEnabled) clearTrailBuffers();
-    updateHUD();
-    leftCtrl.triggerHaptic(0.2, 50);
-  }
-  if (!xPressed && leftCtrl.xButtonDown) {
-    leftCtrl.xButtonDown = false;
   }
 }
 
@@ -1339,8 +1343,7 @@ function animate() {
 
   if (vrSessionActive) {
     try {
-    // Auto-launch balls at start of VR session
-    autoLaunchBalls(now);
+    // Balls start in hands (distributeBallsToHands on session start) — no auto-launch
 
     // Update controller velocities; freeze trails when total velocity below threshold; keep scroll speed constant
     const totalVel = (controllers[0]?.velocity?.length() ?? 0) + (controllers[1]?.velocity?.length() ?? 0);
@@ -1370,7 +1373,6 @@ function animate() {
       checkAutoThrow(now);
     }
 
-    // A-button toggle for auto-throw (right controller)
     checkAutoThrowToggle();
 
     // Update smoke trails

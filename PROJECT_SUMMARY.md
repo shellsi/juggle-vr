@@ -2,6 +2,8 @@
 
 VR juggling game built with Three.js and WebXR. Run locally with Node, use Quest (or compatible headset) to juggle balls with hand tracking and auto-catch/throw logic.
 
+**Live:** https://shellsi.github.io/juggle-vr/
+
 ---
 
 ## Stack
@@ -96,7 +98,7 @@ Constants: `TRAIL_LENGTH` 400, `TRAIL_SCROLL_SPEED` 0.5 m/s, ribbon width clamps
 - **Balls stack backwards from centre** — Top ball (next to throw) at centre, others back (implemented)
 - **Pass-through mixed reality** — See real room while juggling
 - **Clubs** — Juggling clubs instead of (or in addition to) balls
-- **Hand tracking (open/close)** — Natural grip via hand pose, no controller
+- **Hand tracking (open/close)** — Natural grip via hand pose, no controller (implemented)
 - **Rotational velocity** — Spin transfer from hands to balls (implemented)
 - **Bounce juggling** — Balls bounce off floor between catches
 
