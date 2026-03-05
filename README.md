@@ -1,4 +1,4 @@
-![Juggle VR trails](./juggle-vr-screenshot.png)
+<img src="./juggle-vr-screenshot.png" alt="Juggle VR trails" width="600">
 
 # Juggle VR — Project Summary
 
