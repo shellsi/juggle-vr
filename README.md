@@ -1,3 +1,5 @@
+![Juggle VR trails](./juggle-vr-screenshot.png)
+
 # Juggle VR — Project Summary
 
 VR juggling game built with Three.js and WebXR. Run locally with Node, use Quest (or compatible headset) to juggle balls with hand tracking and auto-catch/throw logic.
